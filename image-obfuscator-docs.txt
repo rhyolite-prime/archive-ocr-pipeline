@@ -1,0 +1,9 @@
+python obfuscate.py photo.jpg
+
+python obfuscate.py photo.jpg ./out --method pixelate
+
+python obfuscate.py ./scans --output-dir ./thumbs --method blur
+
+
+
+python obfuscate.py "*.png" -o results
