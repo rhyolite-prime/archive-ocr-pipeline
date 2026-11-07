@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Credentials -- never commit real service account keys
+service_account.json
+client_secrets.json
+token.json
+
+# Pipeline scratch output
+*.tmp

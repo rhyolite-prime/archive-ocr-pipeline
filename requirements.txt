@@ -1,0 +1,14 @@
+# Runtime dependencies for ocr-pipeline.py
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+httplib2
+Pillow
+numpy
+pytesseract          # also needs the tesseract OCR binary on PATH
+PyMuPDF
+requests
+cloudinary
+ollama
+scipy                # optional: fallback path in obfuscate_pdf_thumbnail_smart

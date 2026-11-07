@@ -20,11 +20,166 @@ import cloudinary
 import cloudinary.uploader
 from cloudinary.utils import cloudinary_url
 
+import argparse
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+
 
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# CONCURRENCY SUPPORT
+# ============================================================================
+# The pipeline is dominated by I/O: every page triggers an Ollama
+# classification round-trip, a Cloudinary upload, a master-document upload and
+# a publication POST.  Those are independent per page, so we run them on a
+# thread pool.
+#
+# The pieces of shared state that are NOT safe to share across threads are
+# handled explicitly below:
+#
+#   * Google Drive clients are built per thread.  ``googleapiclient`` uses
+#     ``httplib2``, whose connections are not thread-safe, so each worker gets
+#     its own transport while sharing one (read-mostly) credentials object.
+#   * PyMuPDF/MuPDF objects are never shared between threads.  Each worker
+#     opens its own ``fitz.Document``.  MuPDF also has some library-level
+#     global state, so access is additionally guarded by ``_FITZ_LOCK``
+#     (disable with OCR_FITZ_LOCK=0 if you know your build is safe).
+#   * The Ollama client gets one instance per thread (see ContentClassifier).
+#   * ``cloudinary.config()`` and the logger are configured once, up front,
+#     and only read afterwards.
+# ============================================================================
+
+#: Default number of pages processed concurrently.  Overridable with
+#: --page-workers or the OCR_PAGE_WORKERS environment variable.
+DEFAULT_PAGE_WORKERS = int(os.getenv("OCR_PAGE_WORKERS", min(16, (os.cpu_count() or 4) * 2)))
+
+#: Default number of files downloaded+dispatched concurrently.
+DEFAULT_FILE_WORKERS = int(os.getenv("OCR_FILE_WORKERS", 3))
+
+#: Guard around MuPDF entry points.  See the note above.
+_FITZ_LOCK = threading.RLock()
+_FITZ_LOCK_ENABLED = os.getenv("OCR_FITZ_LOCK", "1") not in ("0", "false", "False")
+
+
+class _fitz_guard:
+    """Context manager serialising MuPDF calls when the lock is enabled."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        if _FITZ_LOCK_ENABLED:
+            _FITZ_LOCK.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if _FITZ_LOCK_ENABLED:
+            _FITZ_LOCK.release()
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Thread-safe progress counter
+# ---------------------------------------------------------------------------
+
+class ProgressCounter:
+    """Thread-safe counter used to report 'x/y' progress from worker threads."""
+
+    def __init__(self, total: int = 0, label: str = "pages"):
+        self._lock = threading.Lock()
+        self._done = 0
+        self._failed = 0
+        self._total = total
+        self._label = label
+        self._started = time.time()
+
+    def set_total(self, total: int) -> None:
+        with self._lock:
+            self._total = total
+
+    def add_total(self, extra: int) -> None:
+        with self._lock:
+            self._total += extra
+
+    def tick(self, ok: bool = True) -> None:
+        with self._lock:
+            if ok:
+                self._done += 1
+            else:
+                self._failed += 1
+            done, failed, total = self._done, self._failed, self._total
+            elapsed = time.time() - self._started
+
+        if done + failed == total or (done + failed) % 10 == 0:
+            rate = (done + failed) / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"[progress] {done + failed}/{total} {self._label} "
+                f"(ok={done}, failed={failed}, {rate:.2f}/s)"
+            )
+
+    @property
+    def failed(self) -> int:
+        with self._lock:
+            return self._failed
+
+    @property
+    def done(self) -> int:
+        with self._lock:
+            return self._done
+
+
+# ---------------------------------------------------------------------------
+# Per-thread Google Drive client
+# ---------------------------------------------------------------------------
+
+_thread_local = threading.local()
+_drive_credentials: Optional[Any] = None
+_drive_credentials_lock = threading.Lock()
+
+
+def set_drive_credentials(credentials) -> None:
+    """Register the credentials used by every worker thread's Drive client."""
+    global _drive_credentials
+    with _drive_credentials_lock:
+        _drive_credentials = credentials
+
+
+def get_drive_service():
+    """
+    Return a Drive client bound to the current thread.
+
+    ``httplib2.Http`` (used underneath ``googleapiclient``) is not thread-safe,
+    so every worker thread gets its own ``AuthorizedHttp`` transport.  The
+    credentials object itself is shared; ``AuthorizedHttp`` only refreshes a
+    token when it has actually expired.
+    """
+    service = getattr(_thread_local, "drive_service", None)
+    if service is not None:
+        return service
+
+    with _drive_credentials_lock:
+        creds = _drive_credentials
+
+    if creds is None:
+        # Called without main() having set credentials (e.g. from a REPL).
+        creds = auth_drive()
+        set_drive_credentials(creds)
+
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+
+        authorized = AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+        service = build("drive", "v3", http=authorized, cache_discovery=False)
+    except ImportError:  # pragma: no cover - optional dependency layout
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    _thread_local.drive_service = service
+    return service
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/drive']
@@ -146,20 +301,43 @@ from typing import Dict, Any, Optional
 
 class ContentClassifier:
     """Handles LLM-powered content classification using Qwen3 8B via Ollama"""
-    
+
+    #: One Ollama client per thread.  The client wraps an ``httpx.Client``,
+    #: which is not safe to share between threads while streaming/reading.
+    _client_tls = threading.local()
+
     def __init__(self, model_name="llama3.2", use_local_ollama=True):
         self.model_name = model_name
         self.use_local_ollama = use_local_ollama
-        
+        self._cache: Dict[str, ExtractedContent] = {}
+        self._cache_lock = threading.Lock()
+
+    def _get_ollama_client(self):
+        client = getattr(ContentClassifier._client_tls, "client", None)
+        if client is None:
+            import ollama
+            host = os.getenv("OLLAMA_HOST") or None
+            timeout = float(os.getenv("OLLAMA_TIMEOUT", "300"))
+            client = ollama.Client(host=host, timeout=timeout) if host else ollama.Client(timeout=timeout)
+            ContentClassifier._client_tls.client = client
+        return client
+
     def classify_text(self, text: str, max_length: int = 9999) -> ExtractedContent:
         """Classify text content using Qwen3 8B via Ollama with robust JSON parsing"""
-        
 
         #print("text presented to ContentClassifier ->")
         #print(text)
 
         truncated_text = text[:max_length] if len(text) > max_length else text
-        
+
+        # Identical pages are common in archives (blank/repeated pages) and the
+        # LLM call dominates the runtime, so memoise on the prompt text.
+        cache_key = truncated_text
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         # Improved prompt that asks for cleaner output
         prompt = f"""Analyze the following newspaper text and extract information. 
         Return ONLY valid JSON with no additional text, no markdown, no explanation.
@@ -173,33 +351,35 @@ class ContentClassifier:
         Content type should be one or more of: vacancy, tender, obituary, news, advert
 
         Return ONLY the JSON object, nothing else."""
-        
+
         try:
             if self.use_local_ollama:
-                import ollama
-                response = ollama.chat(model=self.model_name, messages=[
+                client = self._get_ollama_client()
+                response = client.chat(model=self.model_name, messages=[
                     {'role': 'system', 'content': 'You are a JSON-only document classifier. Never include explanations or markdown. Only output valid JSON.'},
                     {'role': 'user', 'content': prompt}
                 ])
-                
+
                 result = response['message']['content']
 
-                print("llama result ->")
-                print(result)
-                
+                logger.debug("llama result -> %s", result)
+
                 # More robust JSON extraction
                 parsed_data = self._parse_llm_json(result)
-                
-                return ExtractedContent(
+
+                extracted = ExtractedContent(
                     categories=parsed_data.get('categories', []),
                     tags=parsed_data.get('tags', []),
                     entities={},
                     summary=parsed_data.get('summary', text),
                     content_type=parsed_data.get('content_type', 'news')
                 )
+                with self._cache_lock:
+                    self._cache[cache_key] = extracted
+                return extracted
             else:
                 return self._keyword_classification(text)
-                
+
         except Exception as e:
             logger.error(f"LLM classification failed: {e}")
             return self._keyword_classification(text)
@@ -373,16 +553,23 @@ class AdvancedLayoutAnalyzer:
     def __init__(self, use_docling=False):  # Set to False by default to avoid dependency
         self.use_docling = use_docling
         
-    def extract_text_with_layout(self, pdf_path: str, page_number: int = None) -> str:
-        """Extract text with proper layout handling"""
+    def extract_text_with_layout(self, pdf_path: str, page_number: int = None,
+                                 doc: "fitz.Document" = None) -> str:
+        """
+        Extract text with proper layout handling.
+
+        ``doc`` may be supplied by a caller that already has the PDF open (as
+        the concurrent page workers do), in which case it is reused instead of
+        opening the file again.  The document is *not* closed here.
+        """
         if self.use_docling:
             try:
                 return self._extract_with_docling(pdf_path, page_number)
             except Exception as e:
                 logger.warning(f"Docling failed: {e}, using PyMuPDF")
-                return self._extract_with_pymupdf_layout(pdf_path, page_number)
+                return self._extract_with_pymupdf_layout(pdf_path, page_number, doc=doc)
         else:
-            return self._extract_with_pymupdf_layout(pdf_path, page_number)
+            return self._extract_with_pymupdf_layout(pdf_path, page_number, doc=doc)
     
     def _extract_with_docling(self, pdf_path: str, page_number: int = None) -> str:
         """Use Docling for advanced layout analysis"""
@@ -412,22 +599,29 @@ class AdvancedLayoutAnalyzer:
             logger.error(f"Docling extraction failed: {e}")
             return ""
     
-    def _extract_with_pymupdf_layout(self, pdf_path: str, page_number: int = None) -> str:
+    def _extract_with_pymupdf_layout(self, pdf_path: str, page_number: int = None,
+                                     doc: "fitz.Document" = None) -> str:
         """Use PyMuPDF with layout analysis"""
+        owned_doc = doc is None
         try:
-            doc = fitz.open(pdf_path)
-            
+            if owned_doc:
+                with _fitz_guard():
+                    doc = fitz.open(pdf_path)
+
             if page_number is not None:
                 pages = [doc[page_number - 1]]
             else:
                 pages = doc
-            
+
             extracted_text = []
-            for page in pages:
-                text = page.get_text("text", sort=True)
-                extracted_text.append(text)
-            
-            doc.close()
+            with _fitz_guard():
+                for page in pages:
+                    text = page.get_text("text", sort=True)
+                    extracted_text.append(text)
+
+            if owned_doc:
+                with _fitz_guard():
+                    doc.close()
             return self._clean_extracted_text("\n\n".join(extracted_text))
         except Exception as e:
             logger.error(f"PyMuPDF extraction failed: {e}")
@@ -568,7 +762,8 @@ def create_obfuscated_thumbnail_from_pdf_page(page, method="balanced", output_si
         # Convert PDF page to image
         zoom = 1.5
         mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
+        with _fitz_guard():
+            pix = page.get_pixmap(matrix=mat, alpha=False)
         
         # Convert to PIL Image
         img_data = pix.tobytes("png")
@@ -601,8 +796,9 @@ def obfuscate_pdf_thumbnail_smart(page, output_size=(400, 400)):
         # Convert PDF page to high-quality image
         zoom = 2.0  # Higher quality for better text detection
         mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_data = pix.tobytes("png")
+        with _fitz_guard():
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_data = pix.tobytes("png")
         
         # Open with PIL
         img = Image.open(io.BytesIO(img_data))
@@ -876,26 +1072,39 @@ def test_thumbnail_creation():
 # PDF PROCESSING FUNCTIONS
 # ============================================================================
 
-def upload_pdf_page(file_path: str, asset_id: str, page_number: int):
+def upload_pdf_page(file_path: str, asset_id: str, page_number: int,
+                    doc: "fitz.Document" = None):
     """
     Create a single-page PDF from the source file and upload it as the
     master document using the GNP file asset API.
+
+    ``doc`` may be an already-open document owned by the calling thread; it is
+    reused (and left open) instead of reopening the file per page.
     """
     temp_pdf_path = None
+    owned_doc = doc is None
+    new_doc = None
     try:
-        doc = fitz.open(file_path)
-        page = doc.load_page(page_number - 1)
+        if owned_doc:
+            with _fitz_guard():
+                doc = fitz.open(file_path)
 
-        new_doc = fitz.open()
-        new_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+        with _fitz_guard():
+            page = doc.load_page(page_number - 1)
 
-        temp_pdf_path = os.path.join(
-            tempfile.gettempdir(),
-            f"{asset_id}_page_{page_number}.pdf"
-        )
-        new_doc.save(temp_pdf_path)
-        new_doc.close()
-        doc.close()
+            new_doc = fitz.open()
+            new_doc.insert_pdf(doc, from_page=page.number, to_page=page.number)
+
+            temp_pdf_path = os.path.join(
+                tempfile.gettempdir(),
+                f"{asset_id}_page_{page_number}.pdf"
+            )
+            new_doc.save(temp_pdf_path)
+            new_doc.close()
+            new_doc = None
+            if owned_doc:
+                doc.close()
+                doc = None
 
         master_bucket = os.getenv(
             "GNP_MASTER_DOCUMENT_BUCKET",
@@ -915,8 +1124,25 @@ def upload_pdf_page(file_path: str, asset_id: str, page_number: int):
         logger.error(f"Error uploading PDF page {page_number}: {e}")
         return None
     finally:
+        # Only clean up what this call owns: the temp slice we produced and,
+        # if we opened it, the document handle.
+        if new_doc is not None:
+            try:
+                with _fitz_guard():
+                    new_doc.close()
+            except Exception:
+                pass
+        if owned_doc and doc is not None:
+            try:
+                with _fitz_guard():
+                    doc.close()
+            except Exception:
+                pass
         if temp_pdf_path and os.path.exists(temp_pdf_path):
-            os.remove(temp_pdf_path)
+            try:
+                os.remove(temp_pdf_path)
+            except OSError:
+                pass
 
 
 # ============================================================================
@@ -1013,11 +1239,10 @@ def create_enhanced_publication(
 
     try:
         logger.info(f"Sending POST request to {url}")
-        response = requests.post(
-            url,
-            json=data,
-            timeout=300
-        )
+        response = _post_json_with_retry(url, data, timeout=300)
+        if response is None:
+            logger.error("Failed to create enhanced publication: no response")
+            return None
 
         if response.ok:
             logger.info(
@@ -1132,295 +1357,858 @@ def extract_publication_date(text: str) -> Optional[str]:
     return None
 
 
-def download_file(service, file_id, file_name):
-    """Download file from Google Drive"""
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    
-    with open(file_name, 'wb') as f:
-        fh.seek(0)
-        f.write(fh.read())
+# ============================================================================
+# SHARED PIPELINE INSTANCE
+# ============================================================================
+# A single EnhancedOCRPipeline can safely be shared by all page workers:
+#   * AdvancedLayoutAnalyzer is stateless,
+#   * ContentClassifier keeps a locked memo cache and one Ollama client per
+#     thread.
+# Sharing it also lets identical/repeated pages skip the LLM round-trip.
+
+_shared_pipeline: Optional[EnhancedOCRPipeline] = None
+_shared_pipeline_lock = threading.Lock()
+
+
+def get_shared_pipeline(use_docling: bool = False) -> EnhancedOCRPipeline:
+    """Return the process-wide OCR pipeline instance (thread-safe)."""
+    global _shared_pipeline
+    if _shared_pipeline is None:
+        with _shared_pipeline_lock:
+            if _shared_pipeline is None:
+                _shared_pipeline = EnhancedOCRPipeline(use_docling=use_docling)
+    return _shared_pipeline
+
+
+# ============================================================================
+# HTTP RETRY HELPER
+# ============================================================================
+# Running many requests in parallel multiplies the chance of hitting a
+# transient 429/5xx, so the publication call is retried with jittered backoff.
+
+_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _post_json_with_retry(url: str, payload: dict, timeout: int = 300,
+                          attempts: int = None, base_delay: float = None):
+    """POST JSON with bounded exponential backoff. Returns Response | None."""
+    if attempts is None:
+        attempts = int(os.getenv("OCR_HTTP_RETRIES", "3"))
+    if base_delay is None:
+        base_delay = float(os.getenv("OCR_HTTP_RETRY_DELAY", "2.0"))
+
+    last_exc = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            last_exc = exc
+            response = None
+        else:
+            if response.status_code not in _RETRY_STATUS:
+                return response
+
+        if attempt >= attempts:
+            break
+
+        delay = base_delay * (2 ** (attempt - 1))
+        delay += delay * 0.25 * (0.5 - os.urandom(1)[0] / 255.0)
+        status = getattr(response, "status_code", "error")
+        logger.warning(
+            f"POST {url} failed with {status} "
+            f"(attempt {attempt}/{attempts}); retrying in {delay:.1f}s"
+        )
+        time.sleep(delay)
+
+    if last_exc is not None:
+        raise last_exc
+    return response
+
+
+# ============================================================================
+# CONCURRENT PROCESSING ENGINE
+# ============================================================================
+
+class PdfDocumentPool:
+    """
+    Hand out one open ``fitz.Document`` per worker thread for a single file.
+
+    MuPDF documents must not be shared between threads, so each worker opens
+    its own handle.  All handles are closed together once every page of the
+    file has been processed.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self._tls = threading.local()
+        self._lock = threading.Lock()
+        self._docs: List["fitz.Document"] = []
+
+    def get(self) -> "fitz.Document":
+        doc = getattr(self._tls, "doc", None)
+        if doc is None:
+            with _fitz_guard():
+                doc = fitz.open(self.file_path)
+            self._tls.doc = doc
+            with self._lock:
+                self._docs.append(doc)
+        return doc
+
+    def close_all(self) -> None:
+        with self._lock:
+            docs, self._docs = self._docs, []
+        for doc in docs:
+            try:
+                with _fitz_guard():
+                    doc.close()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Error closing PDF handle: {exc}")
+
+
+@dataclass
+class FileContext:
+    """Metadata shared by every worker handling a single source file."""
+
+    file_path: str
+    file_id: str
+    file_type: str                       # "pdf" or "image"
+    total_pages: int = 1
+    edition_number: str = ""
+    publication_date: str = ""
+    doc_pool: Optional[PdfDocumentPool] = None
+
+    @property
+    def label(self) -> str:
+        return os.path.basename(self.file_path)
+
+
+class _FileTask:
+    """
+    Owns the in-flight token for one file, and (when it came through
+    ``ConcurrentPipeline.submit_file``) the backpressure slot as well.
+
+    Exactly one ``_FileTask`` is created per file, so ``finish()`` is called
+    exactly once and ``wait()`` can never block on a stale token.
+    """
+
+    __slots__ = ("engine", "holds_slot", "_lock", "_finished")
+
+    def __init__(self, engine: "ConcurrentPipeline", holds_slot: bool):
+        self.engine = engine
+        self.holds_slot = holds_slot
+        self._lock = threading.Lock()
+        self._finished = False
+        engine._begin_file_task()
+
+    def finish(self, ok: bool = True) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self._finished = True
+        self.engine._finish_file_task(ok=ok)
+        if self.holds_slot:
+            self.engine._release_slot()
+
+
+class _FileJob:
+    """
+    Reference-counted handle for one file.
+
+    The dispatch reference counts as 1; every queued page adds one more.
+    Whoever drops the count to zero finalises the file: close PDF handles,
+    delete the temporary download and finish the associated ``_FileTask``.
+    """
+
+    def __init__(self, engine: "ConcurrentPipeline", ctx: FileContext,
+                 task: Optional[_FileTask] = None):
+        self.engine = engine
+        self.ctx = ctx
+        self.task = task or _FileTask(engine, holds_slot=False)
+        self._lock = threading.Lock()
+        self._remaining = 1
+        self._closed = False
+
+    def add(self, n: int = 1) -> None:
+        with self._lock:
+            self._remaining += n
+
+    def done(self) -> None:
+        with self._lock:
+            self._remaining -= 1
+            should_close = self._remaining <= 0 and not self._closed
+            if should_close:
+                self._closed = True
+        if should_close:
+            self.engine._finalize_file(self.ctx, self.task, ok=True)
+
+
+class ConcurrentPipeline:
+    """Thread-pool driver: downloads files and OCRs their pages concurrently."""
+
+    def __init__(self, page_workers: int = DEFAULT_PAGE_WORKERS,
+                 file_workers: int = DEFAULT_FILE_WORKERS,
+                 max_inflight_files: int = None,
+                 keep_files: bool = False,
+                 dry_run: bool = False):
+        self.page_workers = max(1, int(page_workers))
+        self.file_workers = max(1, int(file_workers))
+        self.max_inflight_files = max(
+            self.file_workers,
+            int(max_inflight_files if max_inflight_files is not None
+                else max(self.file_workers * 2, 4)),
+        )
+        self.keep_files = keep_files
+        self.dry_run = dry_run
+
+        self.page_executor = ThreadPoolExecutor(
+            max_workers=self.page_workers, thread_name_prefix="ocr-page"
+        )
+        self.file_executor = ThreadPoolExecutor(
+            max_workers=self.file_workers, thread_name_prefix="ocr-file"
+        )
+
+        self.counter = ProgressCounter(label="pages")
+        self.files_done = 0
+        self.files_failed = 0
+
+        self._slots = threading.BoundedSemaphore(self.max_inflight_files)
+        self._cond = threading.Condition()
+        self._inflight_files = 0
+        self._submitted_files = 0
+        self._limit_reached = threading.Event()
+        self._file_limit = None
+        self._started = time.time()
+
+    # -- scheduling ------------------------------------------------------
+    def set_file_limit(self, limit: Optional[int]) -> None:
+        self._file_limit = limit
+
+    def submit_file(self, file_id: str, file_name: str) -> None:
+        """Queue one downloaded file for processing."""
+        if self._file_limit is not None:
+            with self._cond:
+                if self._submitted_files >= self._file_limit:
+                    self._limit_reached.set()
+                    return
+                self._submitted_files += 1
+
+        if self.dry_run:
+            logger.info(f"[dry-run] would process {file_name}")
+            task = _FileTask(self, holds_slot=False)
+            task.finish(ok=True)
+            return
+
+        # Backpressure: block the traversal thread once too many files are
+        # in flight, so we never queue an unbounded number of pages.
+        self._slots.acquire()
+        try:
+            task = _FileTask(self, holds_slot=True)
+            self.file_executor.submit(
+                self._download_and_dispatch, file_id, file_name, task
+            )
+        except RuntimeError:
+            # Executor already shut down.
+            task.finish(ok=False)
+            raise
+
+    def _download_and_dispatch(self, file_id: str, file_name: str,
+                               task: _FileTask) -> None:
+        ctx: Optional[FileContext] = None
+        job: Optional[_FileJob] = None
+        try:
+            path = download_file(None, file_id, file_name, process=False)
+            if not path:
+                return
+
+            extension = os.path.splitext(path)[1].lower()
+            if extension == ".pdf":
+                ctx = self._prepare_pdf(path, file_id)
+                if ctx is None:
+                    return
+                job = self._dispatch_pdf(ctx, task)
+            elif extension in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff"):
+                ctx = FileContext(file_path=path, file_id=file_id, file_type="image")
+                job = self._dispatch_pages(ctx, 1, task)
+            else:
+                logger.info(f"Skipping unsupported file type: {path}")
+                ctx = FileContext(path, file_id, "unknown")
+        except Exception as exc:
+            logger.error(f"Error dispatching {file_name}: {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # NOTE: when page work was queued it now owns ``task`` and will
+            # finalise the file; releasing the dispatch reference here would
+            # close documents and delete the download while the last page is
+            # still running.
+            if job is None:
+                if ctx is not None:
+                    self._finalize_file(ctx, task, ok=False)
+                else:
+                    task.finish(ok=False)
+
+    def _prepare_pdf(self, path: str, file_id: str) -> Optional[FileContext]:
+        """Read edition/date from page 1 before fanning out the other pages."""
+        ctx = FileContext(file_path=path, file_id=file_id, file_type="pdf")
+        try:
+            with _fitz_guard():
+                doc = fitz.open(path)
+            try:
+                ctx.total_pages = len(doc)
+                with _fitz_guard():
+                    page = doc.load_page(0)
+                pipeline = get_shared_pipeline()
+                text = pipeline.layout_analyzer.extract_text_with_layout(
+                    path, 1, doc=doc
+                )
+                if not text or len(text.strip()) < 10:
+                    with _fitz_guard():
+                        text = page.get_text("text")
+                ctx.edition_number = extract_edition_number(text) or ""
+                ctx.publication_date = extract_publication_date(text) or ""
+            finally:
+                with _fitz_guard():
+                    doc.close()
+        except Exception as exc:
+            logger.error(f"Failed to inspect PDF {path}: {exc}")
+            return None
+
+        logger.info(
+            f"{os.path.basename(path)}: {ctx.total_pages} pages "
+            f"(edition={ctx.edition_number or 'n/a'}, "
+            f"date={ctx.publication_date or 'n/a'})"
+        )
+        return ctx
+
+    def _dispatch_pdf(self, ctx: FileContext,
+                      task: Optional[_FileTask] = None) -> _FileJob:
+        ctx.doc_pool = PdfDocumentPool(ctx.file_path)
+        return self._dispatch_pages(ctx, ctx.total_pages, task)
+
+    def _dispatch_pages(self, ctx: FileContext, total: int,
+                        task: Optional[_FileTask] = None) -> _FileJob:
+        job = _FileJob(self, ctx, task)
+        job.add(total)
+        self.counter.add_total(total)
+
+        for page_index in range(total):
+            future = self.page_executor.submit(self._run_page, ctx, page_index, job)
+            future.add_done_callback(_consume_future)
+
+        # Give the dispatch reference back immediately: from here on the job
+        # is kept alive purely by its page futures.
+        job.done()
+        return job
+
+    # -- workers ---------------------------------------------------------
+    def _run_page(self, ctx: FileContext, page_index: int, job: _FileJob) -> None:
+        try:
+            if ctx.file_type == "pdf":
+                ok = process_pdf_page(ctx, page_index)
+            else:
+                ok = process_image_file(ctx)
+            self.counter.tick(ok=ok)
+        except Exception as exc:  # never let a page kill the pool
+            logger.error(
+                f"{ctx.label}: unhandled error on page {page_index + 1}: {exc}"
+            )
+            import traceback
+            traceback.print_exc()
+            self.counter.tick(ok=False)
+        finally:
+            job.done()
+
+    # -- lifecycle -------------------------------------------------------
+    def _begin_file_task(self) -> None:
+        with self._cond:
+            self._inflight_files += 1
+
+    def _release_slot(self) -> None:
+        try:
+            self._slots.release()
+        except ValueError:  # pragma: no cover - defensive
+            pass
+
+    def _finalize_file(self, ctx: FileContext, task: _FileTask,
+                       ok: bool = True) -> None:
+        if ctx.doc_pool is not None:
+            ctx.doc_pool.close_all()
+
+        if not self.keep_files:
+            self._cleanup_file(ctx)
+        elif ctx.file_path and os.path.exists(ctx.file_path):
+            logger.info(f"Kept downloaded file: {ctx.file_path}")
+
+        task.finish(ok=ok)
+
+    def _cleanup_file(self, ctx: FileContext) -> None:
+        if ctx.file_path and os.path.exists(ctx.file_path):
+            try:
+                os.remove(ctx.file_path)
+                logger.debug(f"Cleaned up temporary file: {ctx.file_path}")
+            except OSError as exc:
+                logger.warning(f"Could not remove {ctx.file_path}: {exc}")
+
+    def _finish_file_task(self, ok: bool = True) -> None:
+        with self._cond:
+            if ok:
+                self.files_done += 1
+            else:
+                self.files_failed += 1
+            self._inflight_files -= 1
+            self._cond.notify_all()
+
+    # -- waiting ---------------------------------------------------------
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        """Block until every submitted file (and its pages) has finished."""
+        deadline = None if timeout is None else time.time() + timeout
+        with self._cond:
+            while self._inflight_files > 0:
+                remaining = None if deadline is None else deadline - time.time()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+        return True
+
+    def shutdown(self) -> None:
+        self.page_executor.shutdown(wait=True)
+        self.file_executor.shutdown(wait=True)
+
+    def summary(self) -> str:
+        elapsed = time.time() - self._started
+        rate = self.counter.done / elapsed if elapsed > 0 else 0.0
+        return (
+            f"Processed {self.files_done} file(s) / "
+            f"{self.counter.done + self.counter.failed} page(s) in "
+            f"{elapsed:.1f}s ({rate:.2f} pages/s, "
+            f"{self.counter.failed} page failure(s), "
+            f"{self.files_failed} file failure(s), "
+            f"page_workers={self.page_workers}, "
+            f"file_workers={self.file_workers})"
+        )
+
+
+def _consume_future(future: Future) -> None:
+    """Surface exceptions raised by queued work instead of swallowing them."""
+    if future.cancelled():
+        return
+    exc = future.exception()
+    if exc is not None:  # pragma: no cover - _run_page already catches
+        logger.error(f"Page worker raised: {exc}")
+
+
+_engine: Optional[ConcurrentPipeline] = None
+_engine_lock = threading.Lock()
+
+
+def get_engine(**kwargs) -> ConcurrentPipeline:
+    """Return the process-wide pipeline engine, creating it on first use."""
+    global _engine
+    if _engine is None:
+        with _engine_lock:
+            if _engine is None:
+                _engine = ConcurrentPipeline(**kwargs)
+    return _engine
+
+
+def init_engine(page_workers: int = DEFAULT_PAGE_WORKERS,
+                file_workers: int = DEFAULT_FILE_WORKERS,
+                **kwargs) -> ConcurrentPipeline:
+    """(Re)create the shared engine with explicit settings."""
+    global _engine
+    with _engine_lock:
+        _engine = ConcurrentPipeline(
+            page_workers=page_workers, file_workers=file_workers, **kwargs
+        )
+    return _engine
+
+
+# ============================================================================
+# PER-PAGE WORKERS
+# ============================================================================
+
+def process_pdf_page(ctx: FileContext, page_index: int) -> bool:
+    """OCR, upload and publish a single PDF page. Returns True on success."""
+    page_number = page_index + 1
+    label = f"{ctx.label} p{page_number}/{ctx.total_pages}"
+
+    pipeline = get_shared_pipeline()
+    doc = ctx.doc_pool.get()
+    with _fitz_guard():
+        page = doc.load_page(page_index)
+
+    page_text = pipeline.layout_analyzer.extract_text_with_layout(
+        ctx.file_path, page_number, doc=doc
+    )
+    if not page_text or len(page_text.strip()) < 10:
+        with _fitz_guard():
+            page_text = page.get_text("text")
+
+    logger.info(f"{label}: extracted {len(page_text)} characters")
+
+    classification_result = pipeline.process_ocr_text(page_text, ctx.label)
+
+    # One UUID identifies the logical asset/publication. The same ID is used
+    # for the thumbnail upload, the master document upload and the publication.
+    asset_id = str(uuid.uuid4())
+
+    # 1. Create and upload the obfuscated thumbnail.
+    thumbnail_url = None
+    thumbnail_buffer = obfuscate_pdf_thumbnail_smart(page, output_size=(500, 333))
+    if thumbnail_buffer:
+        thumbnail_url = upload_thumbnail_to_cloudinary(
+            thumbnail_buffer, asset_id, page_num=page_number
+        )
+        if thumbnail_url:
+            logger.info(f"{label}: thumbnail uploaded")
+        else:
+            logger.error(f"{label}: thumbnail upload failed")
+    else:
+        logger.error(f"{label}: failed to create thumbnail")
+
+    # 2. Create and upload the single-page master document.
+    master_result = upload_pdf_page(
+        ctx.file_path, asset_id, page_number, doc=doc
+    )
+    if not master_result:
+        logger.error(f"{label}: master upload failed; skipping publication")
+        return False
+
+    pub_date = ctx.publication_date or datetime.now().strftime("%Y-%m-%d")
+
+    # 3. Create the publication entry.
+    create_enhanced_publication(
+        pub_date,
+        str(page_number),
+        classification_result,
+        asset_id,
+        "pdf",
+        ctx.edition_number,
+        thumbnail_url=thumbnail_url,
+    )
+    logger.info(f"{label}: publication created (asset_id={asset_id})")
+    return True
+
+
+def process_image_file(ctx: FileContext) -> bool:
+    """OCR, upload and publish a single image. Returns True on success."""
+    label = ctx.label
+    pipeline = get_shared_pipeline()
+
+    with Image.open(ctx.file_path) as img:
+        extracted_text = pytesseract.image_to_string(img)
+
+    classification_result = pipeline.process_ocr_text(extracted_text, ctx.file_path)
+
+    date, page = extract_info(ctx.file_path)
+    if not (date and page):
+        logger.warning(
+            f"{label}: could not extract date/page from filename; skipping"
+        )
+        return False
+
+    asset_id = str(uuid.uuid4())
+
+    # 1. Upload the obfuscated thumbnail.
+    thumbnail_url = None
+    thumbnail_buffer = create_obfuscated_thumbnail_from_image(
+        ctx.file_path, method="balanced"
+    )
+    if thumbnail_buffer:
+        thumbnail_url = upload_thumbnail_to_cloudinary(
+            thumbnail_buffer, asset_id, page_num=1
+        )
+    if not thumbnail_url:
+        logger.warning(f"{label}: thumbnail upload failed")
+
+    # 2. Upload the original image as the master document.  Uploading from a
+    #    handle (rather than a path) keeps ownership of the file with this
+    #    worker, so the cleanup in _finalize_file stays authoritative.
+    master_bucket = os.getenv(
+        "GNP_MASTER_DOCUMENT_BUCKET", "gnp-master-documents"
+    )
+    lower_name = ctx.file_path.lower()
+    content_type = (
+        "image/jpeg" if lower_name.endswith((".jpg", ".jpeg")) else "image/png"
+    )
+    with open(ctx.file_path, "rb") as master_handle:
+        master_result = upload_file_asset(
+            file_content=master_handle,
+            asset_id=asset_id,
+            bucket_name=master_bucket,
+            file_name=os.path.basename(ctx.file_path),
+            content_type=content_type,
+        )
+
+    if not master_result:
+        logger.error(f"{label}: master upload failed; skipping publication")
+        return False
+
+    # 3. Create the publication entry.
+    create_enhanced_publication(
+        date,
+        page,
+        classification_result,
+        asset_id,
+        "image",
+        "N/A",
+        thumbnail_url=thumbnail_url,
+    )
+    logger.info(f"{label}: publication created (asset_id={asset_id})")
+    return True
+
+
+# ============================================================================
+# DRIVE DOWNLOAD
+# ============================================================================
+
+def download_file(service, file_id, file_name, process=True):
+    """
+    Download a file from Google Drive to ``file_name``.
+
+    When ``process`` is True (the historical behaviour) the file is processed
+    inline.  The concurrent engine calls it with ``process=False`` and
+    dispatches the work itself.
+    """
+    service = service or get_drive_service()
+
+    parent = os.path.dirname(file_name)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    attempts = int(os.getenv("OCR_DOWNLOAD_RETRIES", "3"))
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            request = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+            with open(file_name, 'wb') as f:
+                fh.seek(0)
+                shutil.copyfileobj(fh, f)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                logger.error(f"Download of {file_name} failed: {exc}")
+                return None
+            delay = min(30, 2 ** attempt)
+            logger.warning(
+                f"Download of {file_name} failed ({exc}); "
+                f"retrying in {delay}s ({attempt}/{attempts})"
+            )
+            time.sleep(delay)
+
     logger.info(f"Downloaded {file_name}")
-    
+
+    if not process:
+        return file_name
+
     file_path = os.path.join('.', file_name)
     _, extension = os.path.splitext(file_path)
-    
     if extension.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.bmp']:
         ocr_image(file_path, file_id, service)
     elif extension.lower() == '.pdf':
         process_pdf(file_path, file_id, service)
+    return file_path
 
-def ocr_image(file_path, file_id, service):
-    """Process image with OCR, upload assets, and create publication."""
+
+# ============================================================================
+# BACKWARDS-COMPATIBLE ENTRY POINTS
+# ============================================================================
+
+def ocr_image(file_path, file_id, service=None):
+    """Process a single image with OCR, upload assets, and create publication."""
+    ctx = FileContext(file_path=file_path, file_id=file_id, file_type="image")
+    engine = get_engine()
     try:
-        logger.info(f"Processing image: {file_path}")
-        pipeline = EnhancedOCRPipeline(use_docling=False)
-
-        img = Image.open(file_path)
-        extracted_text = pytesseract.image_to_string(img)
-
-        classification_result = pipeline.process_ocr_text(
-            extracted_text, file_path
-        )
-        logger.info(
-            f"Image classified as: "
-            f"{classification_result['content_type']}"
-        )
-
-        date, page = extract_info(file_path)
-
-        if not (date and page):
-            logger.warning(
-                "Could not extract date and page number from filename. "
-                "Skipping..."
-            )
-            return
-
-        logger.info(f"Date: {date}, Page: {page}")
-
-        # One UUID identifies the logical asset/publication. The same ID is
-        # used for both the thumbnail upload and the master document upload.
-        asset_id = str(uuid.uuid4())
-        logger.info(f"Generated asset_id: {asset_id}")
-
-        # 1. Upload obfuscated thumbnail.
-        thumbnail_buffer = create_obfuscated_thumbnail_from_image(
-            file_path, method="balanced"
-        )
-        thumbnail_result = None
-        if thumbnail_buffer:
-            thumbnail_url = upload_thumbnail_to_cloudinary(
-                thumbnail_buffer, asset_id, page_num=1
-            )
-
-        if not thumbnail_url:
-            logger.warning("Thumbnail upload failed")
-
-        # 2. Upload original image as the master document.
-        master_bucket = os.getenv(
-            "GNP_MASTER_DOCUMENT_BUCKET",
-            "gnp-master-documents"
-        )
-        master_result = upload_file_asset(
-            file_content=file_path,
-            asset_id=asset_id,
-            bucket_name=master_bucket,
-            file_name=os.path.basename(file_path),
-            content_type="image/jpeg"
-            if file_path.lower().endswith((".jpg", ".jpeg"))
-            else "image/png"
-        )
-
-        if not master_result:
-            logger.error("Master document upload failed; skipping publication")
-            return
-
-        # 3. Create publication using asset_id instead of thumbnail_id/document_id.
-        create_enhanced_publication(
-            date,
-            page,
-            classification_result,
-            asset_id,
-            "image",
-            "N/A",
-            thumbnail_url=thumbnail_url,
-        )
-        logger.info(
-            f"Publication created successfully for asset_id={asset_id}"
-        )
-
-    except Exception as e:
-        logger.error(f"Error processing image: {e}")
+        ok = process_image_file(ctx)
+        engine.counter.tick(ok=ok)
+    except Exception as exc:
+        engine.counter.tick(ok=False)
+        logger.error(f"Error processing image: {exc}")
         import traceback
         traceback.print_exc()
+    finally:
+        if not engine.keep_files:
+            engine._cleanup_file(ctx)
 
 
+def process_pdf(file_path, file_id, service=None):
+    """
+    Process a PDF: upload obfuscated thumbnails and per-page master documents.
 
-def process_pdf(file_path, file_id, service):
-    """Process PDF, upload obfuscated thumbnails and master documents."""
-    try:
-        pipeline = EnhancedOCRPipeline(use_docling=False)
-        doc = fitz.open(file_path)
+    Pages are processed on the engine's thread pool; this call blocks until
+    every page of this file is done.
+    """
+    engine = get_engine()
+    ctx = engine._prepare_pdf(file_path, file_id)
+    if ctx is None:
+        engine._cleanup_file(FileContext(file_path, file_id, "pdf"))
+        return
 
-        total_pages = len(doc)
-        base_filename = os.path.basename(file_path)
+    ctx.doc_pool = PdfDocumentPool(file_path)
+    done = threading.Event()
 
-        edition_number = ""
-        publication_date = ""
+    class _InlineJob:
+        """Minimal stand-in for _FileJob so process_pdf can be called standalone."""
 
-        logger.info(
-            f"Processing PDF with {total_pages} pages: {base_filename}"
-        )
+        def done(self):
+            done.set()
 
-        for page_number in range(total_pages):
-            logger.info(f"\\n{'=' * 50}")
-            logger.info(
-                f"Processing page {page_number + 1} of {total_pages}"
-            )
-            logger.info(f"{'=' * 50}")
+    job = _InlineJob()
+    for page_index in range(ctx.total_pages):
+        future = engine.page_executor.submit(engine._run_page, ctx, page_index, job)
+        future.add_done_callback(_consume_future)
 
-            page = doc.load_page(page_number)
+    done.wait()
+    ctx.doc_pool.close_all()
+    if not engine.keep_files:
+        engine._cleanup_file(ctx)
 
-            page_text = pipeline.layout_analyzer.extract_text_with_layout(
-                file_path, page_number + 1
-            )
 
-            if page_number == 0:
-                edition_number = extract_edition_number(page_text) or ""
-                publication_date = extract_publication_date(page_text) or ""
+# ============================================================================
+# DRIVE TRAVERSAL
+# ============================================================================
 
-                logger.info(
-                    f"Extracted edition number: {edition_number}"
-                )
-                logger.info(
-                    f"Extracted publication date: {publication_date}"
-                )
+def _list_children(service, folder_id: str):
+    """Yield every child of a Drive folder, following pagination."""
+    page_token = None
+    while True:
+        results = service.files().list(
+            q=f"'{folder_id}' in parents",
+            pageSize=100,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+        ).execute()
 
-            if not page_text or len(page_text.strip()) < 10:
-                page_text = page.get_text("text")
+        for item in results.get('files', []):
+            yield item
 
-            logger.info(
-                f"Extracted text length: {len(page_text)} characters"
-            )
-
-            classification_result = pipeline.process_ocr_text(
-                page_text, base_filename
-            )
-            logger.info(
-                f"Page {page_number + 1} classified as: "
-                f"{classification_result['content_type']}"
-            )
-
-            # Generate ONE asset_id for this page. The same asset_id is used
-            # by both g3 upload endpoints and in create_enhanced_publication.
-            asset_id = str(uuid.uuid4())
-            logger.info(
-                f"Generated asset_id for page {page_number + 1}: {asset_id}"
-            )
-
-            # 1. Create and upload obfuscated thumbnail.
-            thumbnail_buffer = obfuscate_pdf_thumbnail_smart(
-                page, output_size=(500, 333)
-            )
-
-            thumbnail_result = None
-            if thumbnail_buffer:
-                thumbnail_url = upload_thumbnail_to_cloudinary(
-                    thumbnail_buffer,
-                    asset_id,
-                    page_num=page_number + 1,
-                )
-
-                if thumbnail_url:
-                    logger.info(f"Thumbnail uploaded: {thumbnail_url}")
-                else:
-                    logger.error(
-                        f"Thumbnail upload failed for page "
-                        f"{page_number + 1}"
-                    )
-            else:
-                logger.error(
-                    f"Failed to create thumbnail for page "
-                    f"{page_number + 1}"
-                )
-
-            # 2. Create and upload the single-page master document using
-            # the SAME asset_id.
-            logger.info(
-                f"Uploading master document for page {page_number + 1}"
-            )
-            master_result = upload_pdf_page(
-                file_path,
-                asset_id,
-                page_number + 1
-            )
-
-            if not master_result:
-                logger.error(
-                    f"Master document upload failed for page "
-                    f"{page_number + 1}; skipping publication"
-                )
-                continue
-
-            pub_date = (
-                publication_date
-                if publication_date
-                else datetime.now().strftime("%Y-%m-%d")
-            )
-
-            # 3. Create publication using only asset_id.
-            logger.info(
-                f"Creating publication for page {page_number + 1} "
-                f"with asset_id={asset_id}"
-            )
-
-            create_enhanced_publication(
-                pub_date,
-                str(page_number + 1),
-                classification_result,
-                asset_id,
-                "pdf",
-                edition_number,
-                thumbnail_url=thumbnail_url
-            )
-
-            logger.info(
-                f"Successfully processed page {page_number + 1}"
-            )
-
-        doc.close()
-
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            logger.info(f"Cleaned up temporary PDF file: {file_path}")
-
-    except Exception as e:
-        logger.error(f"Error processing PDF {file_path}: {e}")
-        import traceback
-        traceback.print_exc()
-
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
 
 
 def traverse_and_download(service, folder_id, base_path=''):
-    """Traverse Google Drive folders and download files"""
-    results = service.files().list(
-        q=f"'{folder_id}' in parents",
-        pageSize=100, 
-        fields="nextPageToken, files(id, name, mimeType)"
-    ).execute()
-    items = results.get('files', [])
-    
-    for item in items:
+    """
+    Traverse Google Drive folders and queue every file for processing.
+
+    Files are downloaded and OCR'd concurrently; this function returns as soon
+    as everything has been queued (call ``engine.wait()`` to block).
+    """
+    engine = get_engine()
+    for item in _list_children(service, folder_id):
         logger.info(f"Found {item['name']}")
+
         if item['mimeType'] == 'application/vnd.google-apps.folder':
             new_path = os.path.join(base_path, item['name'])
             os.makedirs(new_path, exist_ok=True)
             traverse_and_download(service, item['id'], new_path)
         else:
             file_path = os.path.join(base_path, item['name'])
-            download_file(service, item['id'], file_path)
+            engine.submit_file(item['id'], file_path)
+
+            if engine._limit_reached.is_set():
+                logger.info("File limit reached; stopping traversal")
+                return
+
 
 def read_folder_ids(file_path):
     """Read folder IDs from file"""
     with open(file_path, 'r') as file:
-        return [line.strip() for line in file]
+        return [line.strip() for line in file if line.strip()]
 
-def main():
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Archive OCR pipeline (concurrent Drive traversal + OCR)"
+    )
+    parser.add_argument(
+        "-p", "--page-workers", type=int, default=DEFAULT_PAGE_WORKERS,
+        help="Pages/images processed concurrently (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-f", "--file-workers", type=int, default=DEFAULT_FILE_WORKERS,
+        help="Files downloaded and dispatched concurrently (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-inflight-files", type=int, default=None,
+        help="Cap on files held in memory/on disk at once (backpressure)",
+    )
+    parser.add_argument(
+        "--folder-ids", default="folder_ids.txt",
+        help="Path to the file listing Drive folder IDs (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Process at most N files (useful for smoke tests)",
+    )
+    parser.add_argument(
+        "--keep-files", action="store_true",
+        help="Do not delete downloaded files after processing",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="List what would be processed without downloading or uploading",
+    )
+    parser.add_argument(
+        "--sequential", action="store_true",
+        help="Disable concurrency (1 page + 1 file worker) as a control run",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
     """Main entry point"""
+    args = parse_args(argv)
+
+    page_workers = 1 if args.sequential else args.page_workers
+    file_workers = 1 if args.sequential else args.file_workers
+
     init_cloudinary()
+
     creds = auth_drive()
-    service = build('drive', 'v3', credentials=creds)
-    
-    folder_ids = read_folder_ids('folder_ids.txt')
-    logger.info(f"Processing folders: {folder_ids}")
-    
-    for folder_id in folder_ids:
-        logger.info(f"Traversing folder: {folder_id}")
-        traverse_and_download(service, folder_id)
+    set_drive_credentials(creds)
+    service = get_drive_service()
+
+    engine = init_engine(
+        page_workers=page_workers,
+        file_workers=file_workers,
+        max_inflight_files=args.max_inflight_files,
+        keep_files=args.keep_files,
+        dry_run=args.dry_run,
+    )
+    engine.set_file_limit(args.limit)
+
+    folder_ids = read_folder_ids(args.folder_ids)
+    logger.info(
+        f"Processing {len(folder_ids)} folder(s) with "
+        f"{page_workers} page worker(s) and {file_workers} file worker(s)"
+    )
+
+    exit_code = 0
+    try:
+        for folder_id in folder_ids:
+            logger.info(f"Traversing folder: {folder_id}")
+            traverse_and_download(service, folder_id)
+        engine.wait()
+    except KeyboardInterrupt:
+        logger.warning("Interrupted; waiting for in-flight work to finish")
+        exit_code = 130
+        engine.wait()
+    finally:
+        engine.shutdown()
+        logger.info(engine.summary())
+        if engine.counter.failed:
+            exit_code = exit_code or 1
+
+    return exit_code
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
