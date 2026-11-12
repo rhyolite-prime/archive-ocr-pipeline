@@ -385,6 +385,42 @@ def test_wait_semantics_and_slot_release():
             engine.shutdown()
 
 
+# ===========================================================================
+# Test 11: tesseract OpenMP budget is configured, not left to oversubscribe
+# ===========================================================================
+def test_tesseract_env_budget():
+    print("\n[11] Tesseract OpenMP thread budget")
+    saved = {k: os.environ.get(k) for k in ("OMP_THREAD_LIMIT", "OMP_NUM_THREADS")}
+    try:
+        # default: one tesseract thread per worker
+        for k in saved:
+            os.environ.pop(k, None)
+        limit = mod.configure_tesseract_env(page_workers=8)
+        check("defaults to one thread per tesseract", limit == 1, limit)
+        check("OMP_THREAD_LIMIT exported for the subprocess",
+              os.environ.get("OMP_THREAD_LIMIT") == "1", os.environ.get("OMP_THREAD_LIMIT"))
+
+        # an explicit env var must win
+        os.environ["OMP_THREAD_LIMIT"] = "4"
+        check("explicit env var wins", mod.configure_tesseract_env(page_workers=8) == 4)
+        os.environ.pop("OMP_THREAD_LIMIT", None)
+
+        # explicit argument is honoured
+        check("explicit argument honoured",
+              mod.configure_tesseract_env(page_workers=4, omp_thread_limit=3) == 3)
+        check("budget arithmetic", 4 * 3 == 12)
+
+        # oversubscription is detected (8 workers x 4 threads on 12 cores)
+        os.environ.pop("OMP_THREAD_LIMIT", None)
+        mod.configure_tesseract_env(page_workers=mod.CPU_COUNT + 8)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main():
     tests = [
         test_pdf_concurrency,
@@ -397,6 +433,7 @@ def main():
         test_document_pool_closes,
         test_progress_counter,
         test_wait_semantics_and_slot_release,
+        test_tesseract_env_budget,
     ]
     cwd = os.getcwd()
     for test in tests:

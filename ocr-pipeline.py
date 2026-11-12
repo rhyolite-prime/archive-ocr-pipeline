@@ -54,16 +54,89 @@ logger = logging.getLogger(__name__)
 #     and only read afterwards.
 # ============================================================================
 
+#: Number of logical CPUs available to this process.  On Apple Silicon this is
+#: the total of performance + efficiency cores (12 on an M2 Max), not just the
+#: performance ones.
+CPU_COUNT = os.cpu_count() or 4
+
 #: Default number of pages processed concurrently.  Overridable with
 #: --page-workers or the OCR_PAGE_WORKERS environment variable.
-DEFAULT_PAGE_WORKERS = int(os.getenv("OCR_PAGE_WORKERS", min(16, (os.cpu_count() or 4) * 2)))
+#:
+#: One worker per CPU is the right default because the per-page work is
+#: largely CPU-bound (tesseract + PyMuPDF rasterising) once the network calls
+#: are running in parallel.  Going far above the core count only adds context
+#: switching - see configure_tesseract_env() for the other half of the story.
+DEFAULT_PAGE_WORKERS = int(os.getenv("OCR_PAGE_WORKERS", min(16, CPU_COUNT)))
 
-#: Default number of files downloaded+dispatched concurrently.
+#: Default number of files downloaded+dispatched concurrently.  Downloads are
+#: network-bound and cost almost no CPU, so they do not compete with OCR.
 DEFAULT_FILE_WORKERS = int(os.getenv("OCR_FILE_WORKERS", 3))
 
 #: Guard around MuPDF entry points.  See the note above.
 _FITZ_LOCK = threading.RLock()
 _FITZ_LOCK_ENABLED = os.getenv("OCR_FITZ_LOCK", "1") not in ("0", "false", "False")
+
+
+# ---------------------------------------------------------------------------
+# Tesseract / OpenMP thread budget
+# ---------------------------------------------------------------------------
+# tesseract is spawned as a *subprocess* per OCR call, and the Homebrew/macOS
+# builds are compiled with OpenMP: by default each process starts as many
+# threads as there are cores.  Run 8 of those concurrently on an 8-core budget
+# and you get 8 x 8 threads fighting over the same cores, which is measurably
+# slower than serial because every thread pays for context switches.
+#
+# pytesseract passes ``os.environ`` straight to the subprocess, so setting
+# OMP_THREAD_LIMIT here propagates to every tesseract run.
+#
+# Rule of thumb: page_workers x OMP_THREAD_LIMIT should approximate the number
+# of cores you are willing to give the pipeline.
+#
+#   OMP_THREAD_LIMIT=1  -> one single-threaded tesseract per worker. Best when
+#                          you run one worker per core (the default).
+#   OMP_THREAD_LIMIT=2-4 -> fewer, fatter workers. Slightly better cache
+#                          locality, at the cost of coarser scheduling.
+
+def configure_tesseract_env(page_workers: Optional[int] = None,
+                            omp_thread_limit: Optional[int] = None) -> int:
+    """
+    Pin tesseract's OpenMP thread count so concurrent workers do not
+    oversubscribe the CPU.  Returns the limit that is in effect.
+
+    An explicit OMP_THREAD_LIMIT in the environment always wins.
+    """
+    existing = os.getenv("OMP_THREAD_LIMIT")
+    if existing not in (None, ""):
+        try:
+            return int(existing)
+        except ValueError:
+            logger.warning(f"Ignoring non-numeric OMP_THREAD_LIMIT={existing!r}")
+
+    if omp_thread_limit is None:
+        # Default to one tesseract thread per worker.
+        omp_thread_limit = 1
+    omp_thread_limit = max(1, int(omp_thread_limit))
+
+    workers = int(page_workers or DEFAULT_PAGE_WORKERS)
+    os.environ["OMP_THREAD_LIMIT"] = str(omp_thread_limit)
+    # Fully initialise OpenMP before the fork so tesseract does not try to
+    # spawn a thread pool in a forked child.  Harmless when not multi-threaded.
+    os.environ.setdefault("OMP_NUM_THREADS", str(omp_thread_limit))
+
+    budget = workers * omp_thread_limit
+    if budget > CPU_COUNT:
+        logger.warning(
+            f"OMP thread budget is {workers} page workers x {omp_thread_limit} "
+            f"tesseract thread(s) = {budget} vs {CPU_COUNT} available CPU(s); "
+            f"workers will contend. Lower --page-workers to {CPU_COUNT} or set "
+            f"OMP_THREAD_LIMIT=1."
+        )
+    else:
+        logger.info(
+            f"OMP thread budget: {workers} page workers x {omp_thread_limit} "
+            f"tesseract thread(s) = {budget} of {CPU_COUNT} CPU(s)"
+        )
+    return omp_thread_limit
 
 
 class _fitz_guard:
@@ -2160,6 +2233,21 @@ def parse_args(argv=None):
         "--sequential", action="store_true",
         help="Disable concurrency (1 page + 1 file worker) as a control run",
     )
+    parser.add_argument(
+        "--omp-thread-limit", type=int, default=None,
+        help=(
+            "Threads per tesseract subprocess (default: 1). "
+            "Roughly, page_workers x this should equal your CPU count; "
+            "an OMP_THREAD_LIMIT env var takes precedence."
+        ),
+    )
+    parser.add_argument(
+        "--cpus", type=int, default=None,
+        help=(
+            "CPU budget to target: sets --page-workers to this many workers "
+            "with OMP_THREAD_LIMIT=1 (overrides --page-workers)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2167,8 +2255,18 @@ def main(argv=None):
     """Main entry point"""
     args = parse_args(argv)
 
-    page_workers = 1 if args.sequential else args.page_workers
+    if args.cpus is not None:
+        # --cpus is a convenience for "use N cores": one single-threaded
+        # tesseract per worker.
+        page_workers = max(1, args.cpus)
+    else:
+        page_workers = args.page_workers if not args.sequential else 1
     file_workers = 1 if args.sequential else args.file_workers
+
+    configure_tesseract_env(
+        page_workers=page_workers,
+        omp_thread_limit=args.omp_thread_limit,
+    )
 
     init_cloudinary()
 
