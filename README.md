@@ -99,11 +99,89 @@ Because the 8 performance cores are the ones that matter for OCR, this keeps
 all the heavy work on the P-cores and leaves the 4 E-cores free for macOS,
 Ollama and the network callbacks.
 
+### Flag precedence
+
+Only one flag should decide the worker count, so the rules are explicit:
+
+```
+--sequential   beats  --cpus   beats  --page-workers   beats  default
+```
+
+- `--sequential` always forces **1 page + 1 file worker**, even alongside
+  `--cpus`. That makes it a trustworthy baseline to time against.
+- `--cpus N` and `--page-workers N` set the same knob; `--cpus` wins if you
+  pass both.
+- `--omp-thread-limit N` sets the other half of the budget (threads per
+  tesseract). An `OMP_THREAD_LIMIT` env var beats it, so shell-level tuning
+  stays authoritative.
+- `-f/--file-workers` is independent: it only controls downloads, which are
+  network-bound and use almost no CPU.
+
+Every run logs exactly what it resolved, so there is no guessing:
+
+```
+Concurrency: 8 page worker(s) x 1 tesseract thread(s) = 8 of 12 CPU(s) [--cpus]; 3 file worker(s)
+```
+
+If the budget oversubscribes your CPU count (or wastes half of it) the
+pipeline says so at startup rather than silently running slowly.
+
+### Recipes
+
+```bash
+# Daily run on an M2 Max: 8 OCR workers, 3 downloaders
+python ocr-pipeline.py --cpus 8
+
+# Same thing, spelled explicitly
+OMP_THREAD_LIMIT=1 python ocr-pipeline.py -p 8 -f 3
+
+# Ollama also on this machine and sharing cores: leave it more room
+python ocr-pipeline.py --cpus 6
+
+# Fewer, fatter tesseract processes for the same 12-thread budget
+python ocr-pipeline.py -p 6 --omp-thread-limit 2
+
+# Baseline to compare against (1 page, 1 file)
+python ocr-pipeline.py --sequential
+
+# Smoke-test 5 files without deleting what it downloaded
+python ocr-pipeline.py --cpus 8 --limit 5 --keep-files
+```
+
+Do **not** stack `--cpus` with `-p`: `--cpus` silently wins, which is exactly
+the kind of ambiguity this precedence list exists to remove.
+
+### What to change if it is still slow
+
+Diagnose before adding threads — more workers past the bottleneck only adds
+queueing and 429s.
+
+| Symptom | Likely bottleneck | Action |
+|---|---|---|
+| All cores busy, workers idle at ~100% CPU | OCR (tesseract/raster) | Already saturated; raise `--cpus` only if you have spare cores |
+| Workers waiting on Ollama, low CPU | LLM classification | `OLLAMA_NUM_PARALLEL` on the Ollama side; keep 1 model resident |
+| `429`/`5xx` in the log | Upload/publication endpoint | Lower `-p`; retries are already built in |
+| Slow to start each file, few pages per file | Download/dispatch | Raise `-f` (cheap: network-bound) |
+| Memory pressure / swap | Too many in-flight pages | Lower `--max-inflight-files` |
+
+The classifier already memoises identical page text, so repeated or blank
+pages skip the LLM round-trip entirely — expect a bigger gain than the thread
+count alone on archive scans that repeat content.
+
 Two other practical notes for M-series:
 
 - **Leave headroom for Ollama.** If Ollama runs on the same machine it needs
   CPU/GPU time too. `--cpus 8` of 12 is a sensible split; if you see the LLM
   call become the bottleneck, drop to `--cpus 6`.
+- **Raise Ollama's own concurrency.** Ollama serves only a few requests in
+  parallel by default, so a high `--page-workers` just queues requests inside
+  Ollama. Set it on the Ollama side (environment of the `ollama serve`
+  process, not this script):
+  ```bash
+  OLLAMA_NUM_PARALLEL=4 OLLAMA_MAX_LOADED_MODELS=1 ollama serve
+  ```
+  Keep `OLLAMA_MAX_LOADED_MODELS=1` so the model stays resident; loading it
+  once per request would dominate everything else.
 - **`--omp-thread-limit 2` with `-p 6`** is a reasonable alternative: fewer,
   fatter tesseract processes (less per-process startup overhead, better cache
   locality) for the same 12-thread budget. Measure both — on Apple Silicon the

@@ -101,42 +101,26 @@ def configure_tesseract_env(page_workers: Optional[int] = None,
                             omp_thread_limit: Optional[int] = None) -> int:
     """
     Pin tesseract's OpenMP thread count so concurrent workers do not
-    oversubscribe the CPU.  Returns the limit that is in effect.
+    oversubscribe the CPU, and export it for tesseract subprocesses.
 
-    An explicit OMP_THREAD_LIMIT in the environment always wins.
+    Returns the limit that is in effect.  An explicit OMP_THREAD_LIMIT in the
+    environment always wins over the argument.
     """
-    existing = os.getenv("OMP_THREAD_LIMIT")
-    if existing not in (None, ""):
+    env_limit = os.getenv("OMP_THREAD_LIMIT")
+    if env_limit not in (None, ""):
         try:
-            return int(existing)
+            limit = max(1, int(env_limit))
         except ValueError:
-            logger.warning(f"Ignoring non-numeric OMP_THREAD_LIMIT={existing!r}")
-
-    if omp_thread_limit is None:
-        # Default to one tesseract thread per worker.
-        omp_thread_limit = 1
-    omp_thread_limit = max(1, int(omp_thread_limit))
-
-    workers = int(page_workers or DEFAULT_PAGE_WORKERS)
-    os.environ["OMP_THREAD_LIMIT"] = str(omp_thread_limit)
-    # Fully initialise OpenMP before the fork so tesseract does not try to
-    # spawn a thread pool in a forked child.  Harmless when not multi-threaded.
-    os.environ.setdefault("OMP_NUM_THREADS", str(omp_thread_limit))
-
-    budget = workers * omp_thread_limit
-    if budget > CPU_COUNT:
-        logger.warning(
-            f"OMP thread budget is {workers} page workers x {omp_thread_limit} "
-            f"tesseract thread(s) = {budget} vs {CPU_COUNT} available CPU(s); "
-            f"workers will contend. Lower --page-workers to {CPU_COUNT} or set "
-            f"OMP_THREAD_LIMIT=1."
-        )
+            logger.warning(f"Ignoring non-numeric OMP_THREAD_LIMIT={env_limit!r}")
+            limit = max(1, int(omp_thread_limit or 1))
     else:
-        logger.info(
-            f"OMP thread budget: {workers} page workers x {omp_thread_limit} "
-            f"tesseract thread(s) = {budget} of {CPU_COUNT} CPU(s)"
-        )
-    return omp_thread_limit
+        limit = max(1, int(omp_thread_limit or 1))
+
+    # pytesseract passes os.environ to the tesseract subprocess, so these
+    # reach it.  OMP_NUM_THREADS is setdef so an explicit value is preserved.
+    os.environ["OMP_THREAD_LIMIT"] = str(limit)
+    os.environ.setdefault("OMP_NUM_THREADS", str(limit))
+    return limit
 
 
 class _fitz_guard:
@@ -2197,6 +2181,106 @@ def read_folder_ids(file_path):
         return [line.strip() for line in file if line.strip()]
 
 
+# ============================================================================
+# CONCURRENCY SETTINGS RESOLUTION
+# ============================================================================
+# Precedence, highest first:
+#   1. --sequential      forces 1 page + 1 file worker (control run)
+#   2. --cpus N          N single-threaded page workers
+#   3. --page-workers N  explicit page worker count
+#   4. defaults          CPU-bounded, see DEFAULT_* above
+#
+# ``--cpus`` and ``--page-workers`` are two spellings of the same knob: the
+# worker count.  ``--omp-thread-limit`` is the *other* half of the CPU budget,
+# so ``--cpus N`` simply pins it to 1.
+
+@dataclass
+class ConcurrencySettings:
+    """Resolved CPU/concurrency budget for one run."""
+
+    page_workers: int
+    file_workers: int
+    omp_thread_limit: int
+    source: str                       # how page_workers was decided
+
+    @property
+    def cpu_budget(self) -> int:
+        return self.page_workers * self.omp_thread_limit
+
+    def describe(self) -> str:
+        """One-line summary written to the log at startup."""
+        detail = (
+            f"{self.page_workers} page worker(s) x "
+            f"{self.omp_thread_limit} tesseract thread(s) = "
+            f"{self.cpu_budget} of {CPU_COUNT} CPU(s) "
+            f"[{self.source}]; {self.file_workers} file worker(s)"
+        )
+        return detail
+
+    def warnings(self) -> List[str]:
+        """Human-readable problems with this budget, if any."""
+        out = []
+        if self.cpu_budget > CPU_COUNT:
+            out.append(
+                f"CPU budget {self.cpu_budget} exceeds the {CPU_COUNT} "
+                f"available CPU(s): OCR workers will contend. Use --cpus "
+                f"{CPU_COUNT}, or set --omp-thread-limit 1 and lower "
+                f"--page-workers."
+            )
+        elif self.cpu_budget < CPU_COUNT * 0.5:
+            out.append(
+                f"CPU budget {self.cpu_budget} uses less than half of the "
+                f"{CPU_COUNT} available CPU(s); you can likely raise "
+                f"--page-workers to {CPU_COUNT}."
+            )
+        if self.page_workers > CPU_COUNT:
+            out.append(
+                f"--page-workers {self.page_workers} exceeds the {CPU_COUNT} "
+                f"CPU(s); the per-page work is CPU-bound, so extra workers "
+                f"mostly add context switching."
+            )
+        return out
+
+
+def resolve_concurrency(page_workers: Optional[int] = None,
+                        file_workers: Optional[int] = None,
+                        sequential: bool = False,
+                        cpus: Optional[int] = None,
+                        omp_thread_limit: Optional[int] = None) -> ConcurrencySettings:
+    """
+    Turn user flags into a concrete concurrency budget.
+
+    An explicit ``OMP_THREAD_LIMIT`` in the environment always wins over
+    ``--omp-thread-limit`` so shell-level tuning stays authoritative.
+    """
+    env_limit = os.getenv("OMP_THREAD_LIMIT")
+
+    if sequential:
+        workers, source = 1, "--sequential"
+    elif cpus is not None:
+        workers, source = max(1, int(cpus)), "--cpus"
+    elif page_workers is not None:
+        workers, source = max(1, int(page_workers)), "--page-workers"
+    else:
+        workers, source = DEFAULT_PAGE_WORKERS, "default"
+
+    if env_limit not in (None, ""):
+        limit = max(1, int(env_limit))
+    elif omp_thread_limit is not None:
+        limit = max(1, int(omp_thread_limit))
+    else:
+        limit = 1
+
+    files = 1 if sequential else max(1, int(file_workers or DEFAULT_FILE_WORKERS))
+
+    return ConcurrencySettings(
+        page_workers=workers,
+        file_workers=files,
+        omp_thread_limit=limit,
+        source=source,
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Archive OCR pipeline (concurrent Drive traversal + OCR)"
@@ -2255,18 +2339,23 @@ def main(argv=None):
     """Main entry point"""
     args = parse_args(argv)
 
-    if args.cpus is not None:
-        # --cpus is a convenience for "use N cores": one single-threaded
-        # tesseract per worker.
-        page_workers = max(1, args.cpus)
-    else:
-        page_workers = args.page_workers if not args.sequential else 1
-    file_workers = 1 if args.sequential else args.file_workers
+    settings = resolve_concurrency(
+        page_workers=args.page_workers,
+        file_workers=args.file_workers,
+        sequential=args.sequential,
+        cpus=args.cpus,
+        omp_thread_limit=args.omp_thread_limit,
+    )
+    page_workers = settings.page_workers
+    file_workers = settings.file_workers
 
     configure_tesseract_env(
         page_workers=page_workers,
-        omp_thread_limit=args.omp_thread_limit,
+        omp_thread_limit=settings.omp_thread_limit,
     )
+    logger.info(f"Concurrency: {settings.describe()}")
+    for problem in settings.warnings():
+        logger.warning(problem)
 
     init_cloudinary()
 

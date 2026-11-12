@@ -421,6 +421,61 @@ def test_tesseract_env_budget():
                 os.environ[k] = v
 
 
+# ===========================================================================
+# Test 12: flag precedence and CPU budget resolution
+# ===========================================================================
+def test_concurrency_resolution():
+    print("\n[12] Concurrency flag precedence")
+    r = mod.resolve_concurrency
+
+    check("default is CPU-bounded",
+          r().page_workers == mod.DEFAULT_PAGE_WORKERS, r().page_workers)
+    check("--sequential forces one worker", r(sequential=True).page_workers == 1)
+    # regression: --cpus used to silently override --sequential
+    check("--sequential beats --cpus",
+          r(sequential=True, cpus=8).page_workers == 1,
+          r(sequential=True, cpus=8).page_workers)
+    check("--sequential forces one file worker",
+          r(sequential=True, file_workers=4).file_workers == 1)
+    check("--cpus sets page workers", r(cpus=8).page_workers == 8)
+    check("--cpus beats --page-workers",
+          r(page_workers=3, cpus=8).page_workers == 8)
+    check("--page-workers honoured", r(page_workers=4).page_workers == 4)
+    check("budget = workers x omp",
+          r(cpus=8, omp_thread_limit=2).cpu_budget == 16)
+    check("source is reported",
+          r(cpus=8).source == "--cpus", r(cpus=8).source)
+
+    saved = os.environ.get("OMP_THREAD_LIMIT")
+    try:
+        # an env var wins over the flag, so shell tuning stays authoritative
+        os.environ["OMP_THREAD_LIMIT"] = "3"
+        check("OMP_THREAD_LIMIT env beats flag",
+              r(cpus=8, omp_thread_limit=2).omp_thread_limit == 3,
+              r(cpus=8, omp_thread_limit=2).omp_thread_limit)
+    finally:
+        if saved is None:
+            os.environ.pop("OMP_THREAD_LIMIT", None)
+        else:
+            os.environ["OMP_THREAD_LIMIT"] = saved
+
+    over = r(cpus=mod.CPU_COUNT * 4)
+    check("oversubscription is warned about", bool(over.warnings()))
+    # make this independent of the machine's core count
+    saved_cpus = mod.CPU_COUNT
+    try:
+        mod.CPU_COUNT = 12
+        under = r(cpus=2)
+        check("underutilisation is noted",
+              any("half" in w for w in under.warnings()), under.warnings())
+        check("no underuse warning at full budget",
+              r(cpus=12).warnings() == [], r(cpus=12).warnings())
+    finally:
+        mod.CPU_COUNT = saved_cpus
+    good = r(cpus=mod.CPU_COUNT)
+    check("a balanced default warns about nothing", good.warnings() == [], good.warnings())
+
+
 def main():
     tests = [
         test_pdf_concurrency,
@@ -434,6 +489,7 @@ def main():
         test_progress_counter,
         test_wait_semantics_and_slot_release,
         test_tesseract_env_budget,
+        test_concurrency_resolution,
     ]
     cwd = os.getcwd()
     for test in tests:
